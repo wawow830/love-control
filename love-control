@@ -1,0 +1,1713 @@
+#!/usr/bin/env python3
+"""love-control — modular, pipeable LÖVE2D automation on Hyprland/Wayland."""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+# ── Constants ──
+CACHE_DIR = Path.home() / ".cache" / "love-control"
+STATE_FILE = CACHE_DIR / "state.json"
+FACTOR_CACHE_FILE = CACHE_DIR / "ydotool_factor.json"
+FACTOR_CACHE_TTL = 3600
+
+EXIT_SUCCESS = 0
+EXIT_GENERAL = 1
+EXIT_NO_WINDOW = 2
+EXIT_NOT_FOUND = 3
+EXIT_CMD_FAILED = 4
+EXIT_TIMEOUT = 5
+EXIT_BAD_ARGS = 6
+
+POLL_INTERVAL = 0.1
+POLL_TIMEOUT = 5.0
+
+KEY_MAP = {
+    "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
+    "h": 35, "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49,
+    "o": 24, "p": 25, "q": 16, "r": 19, "s": 31, "t": 20, "u": 22,
+    "v": 47, "w": 17, "x": 45, "y": 21, "z": 44,
+    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+    "escape": 1, "backspace": 14, "tab": 15, "return": 28, "enter": 28,
+    "leftctrl": 29, "lctrl": 29, "rightctrl": 97, "rctrl": 97,
+    "leftshift": 42, "lshift": 42, "rightshift": 54, "rshift": 54,
+    "leftalt": 56, "lalt": 56, "rightalt": 100, "ralt": 100,
+    "leftmeta": 125, "lmeta": 125, "leftgui": 125, "lgui": 125,
+    "rightmeta": 126, "rmeta": 126, "rightgui": 126, "rgui": 126,
+    "space": 57, "capslock": 58,
+    "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64,
+    "f7": 65, "f8": 66, "f9": 67, "f10": 68, "f11": 87, "f12": 88,
+    "numlock": 69, "scrolllock": 70,
+    "sysrq": 99, "printscreen": 99,
+    "home": 102, "up": 103, "pageup": 104, "left": 105, "right": 106,
+    "end": 107, "down": 108, "pagedown": 109, "insert": 110, "delete": 111,
+    "pause": 119, "compose": 127, "menu": 127, "application": 127,
+    "minus": 12, "-": 12,
+    "equal": 13, "equals": 13, "=": 13,
+    "leftbracket": 26, "[": 26,
+    "rightbracket": 27, "]": 27,
+    "semicolon": 39, ";": 39,
+    "apostrophe": 40, "quote": 40, "'": 40,
+    "grave": 41, "backtick": 41, "`": 41,
+    "backslash": 43, "\\": 43,
+    "comma": 51, ",": 51,
+    "period": 52, "dot": 52, ".": 52,
+    "slash": 53, "/": 53,
+    "kp0": 82, "kp1": 79, "kp2": 80, "kp3": 81, "kp4": 75,
+    "kp5": 76, "kp6": 77, "kp7": 71, "kp8": 72, "kp9": 73,
+    "kpdot": 83, "kp.": 83,
+    "kpslash": 98, "kp/": 98,
+    "kpasterisk": 55, "kp*": 55,
+    "kpminus": 74, "kp-": 74,
+    "kpplus": 78, "kp+": 78,
+    "kpenter": 96,
+    "kpequal": 117, "kp=": 117,
+}
+
+MOUSE_BUTTONS = {
+    "left": {"click": "0xC0", "down": "0x40", "up": "0x80"},
+    "right": {"click": "0xC1", "down": "0x41", "up": "0x81"},
+    "middle": {"click": "0xC2", "down": "0x42", "up": "0x82"},
+}
+
+
+# ── Custom exception for controlled exits ──
+class LoveControlError(Exception):
+    def __init__(self, data, code=EXIT_GENERAL):
+        self.data = data
+        self.code = code
+        super().__init__(data.get("message", ""))
+
+
+def fail(error_code, message, exit_code=EXIT_GENERAL, extra=None):
+    data = {"ok": False, "error": error_code, "message": message}
+    if extra:
+        data.update(extra)
+    raise LoveControlError(data, exit_code)
+
+
+# ── JSON I/O & Pipeline State ──
+def read_stdin_state():
+    if sys.stdin.isatty():
+        return None
+    try:
+        return json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def require_keys(state, *keys):
+    missing = [k for k in keys if k not in state]
+    if missing:
+        fail("bad_args", f"Missing required fields from stdin or args: {', '.join(missing)}", EXIT_BAD_ARGS)
+
+
+# ── Core Infrastructure ──
+def run(args, check=True, timeout=10):
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if check and proc.returncode != 0:
+            return None, f"command failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}", proc.returncode
+        return proc.stdout, None, proc.returncode
+    except subprocess.TimeoutExpired:
+        return None, f"command timed out: {' '.join(args)}", None
+    except FileNotFoundError:
+        return None, f"command not found: {args[0]}", None
+
+
+def find_love_window(max_wait=POLL_TIMEOUT):
+    end = time.time() + max_wait
+    while True:
+        stdout, err, _ = run(["hyprctl", "clients", "-j"], check=False, timeout=5)
+        if stdout:
+            try:
+                clients = json.loads(stdout)
+            except json.JSONDecodeError:
+                clients = []
+            love_clients = []
+            for c in clients:
+                cls = c.get("class", "") or ""
+                initial = c.get("initialClass", "") or ""
+                if cls == "love" or initial == "love":
+                    love_clients.append(c)
+            if love_clients:
+                focused = [c for c in love_clients if c.get("focused")]
+                if focused:
+                    return focused[0]
+                return love_clients[0]
+        if time.time() >= end:
+            return None
+        time.sleep(POLL_INTERVAL)
+
+
+def focus_window(address):
+    run(["hyprctl", "dispatch", "focuswindow", f"address:{address}"], check=False, timeout=5)
+
+
+# ── Cursor helpers ──
+_CURSOR_STACK = []
+
+def push_cursor():
+    stdout, err, _ = run(["hyprctl", "cursorpos", "-j"], check=False, timeout=3)
+    if not stdout:
+        _CURSOR_STACK.append(None)
+        return
+    try:
+        pos = json.loads(stdout)
+        _CURSOR_STACK.append((pos["x"], pos["y"]))
+    except (json.JSONDecodeError, KeyError):
+        _CURSOR_STACK.append(None)
+
+
+def pop_cursor():
+    if not _CURSOR_STACK:
+        return
+    pos = _CURSOR_STACK.pop()
+    if pos is None:
+        return
+    x, y = pos
+    run(["hyprctl", "dispatch", "movecursor", str(x), str(y)], check=False, timeout=3)
+
+
+def hide_cursor_for_screenshot():
+    push_cursor()
+    run(["hyprctl", "dispatch", "movecursor", "0", "0"], check=False, timeout=3)
+
+
+def unhide_cursor_after_screenshot():
+    pop_cursor()
+
+
+# ── Coordinate conversion ──
+_MONITOR_SCALES = {}
+_YDOTOOL_FACTOR = None
+
+def get_monitor_scale(monitor_id):
+    global _MONITOR_SCALES
+    if monitor_id in _MONITOR_SCALES:
+        return _MONITOR_SCALES[monitor_id]
+    stdout, err, _ = run(["hyprctl", "monitors", "-j"], check=False, timeout=5)
+    scale = 1.0
+    if stdout:
+        try:
+            monitors = json.loads(stdout)
+            for m in monitors:
+                if m.get("id") == monitor_id:
+                    scale = float(m.get("scale", 1.0))
+                    break
+        except (json.JSONDecodeError, ValueError):
+            pass
+    _MONITOR_SCALES[monitor_id] = scale
+    return scale
+
+
+def discover_ydotool_factor():
+    pos_old, err, _ = run(["hyprctl", "cursorpos", "-j"], check=False, timeout=3)
+    if err:
+        return 1.0
+    try:
+        old = json.loads(pos_old)
+        old_x, old_y = old["x"], old["y"]
+    except (json.JSONDecodeError, KeyError):
+        return 1.0
+    _ydotool(["mousemove", "-a", "-x", "100", "-y", "100"])
+    pos_new, err, _ = run(["hyprctl", "cursorpos", "-j"], check=False, timeout=3)
+    run(["hyprctl", "dispatch", "movecursor", str(old_x), str(old_y)], check=False, timeout=3)
+    if err:
+        return 1.0
+    try:
+        new = json.loads(pos_new)
+        new_x, new_y = new["x"], new["y"]
+    except (json.JSONDecodeError, KeyError):
+        return 1.0
+    fx = new_x / 100.0
+    fy = new_y / 100.0
+    factor = (fx + fy) / 2.0
+    if factor <= 0:
+        factor = 1.0
+    return factor
+
+
+def get_ydotool_factor():
+    global _YDOTOOL_FACTOR
+    if _YDOTOOL_FACTOR is not None:
+        return _YDOTOOL_FACTOR
+    env = os.environ.get("LOVE_CONTROL_YDOTOOL_FACTOR")
+    if env:
+        try:
+            _YDOTOOL_FACTOR = float(env)
+            return _YDOTOOL_FACTOR
+        except ValueError:
+            pass
+    if FACTOR_CACHE_FILE.exists():
+        try:
+            with open(FACTOR_CACHE_FILE) as f:
+                cache = json.load(f)
+            if time.time() - cache.get("ts", 0) < FACTOR_CACHE_TTL:
+                _YDOTOOL_FACTOR = float(cache["factor"])
+                return _YDOTOOL_FACTOR
+        except (json.JSONDecodeError, ValueError, OSError, KeyError):
+            pass
+    _YDOTOOL_FACTOR = discover_ydotool_factor()
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(FACTOR_CACHE_FILE, "w") as f:
+            json.dump({"factor": _YDOTOOL_FACTOR, "ts": time.time()}, f)
+    except OSError:
+        pass
+    return _YDOTOOL_FACTOR
+
+
+def window_pixels_to_hypr(wx_logical, wy_logical, px_physical, py_physical, scale):
+    return int(wx_logical + (px_physical / scale)), int(wy_logical + (py_physical / scale))
+
+
+def hypr_to_ydotool(hx, hy, factor):
+    return int(hx / factor), int(hy / factor)
+
+
+# ── Scope ──
+def get_scope():
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f).get("scope")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def set_scope(scope):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    if scope is None:
+        data.pop("scope", None)
+    else:
+        data["scope"] = scope
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)
+
+
+# ── Key resolution ──
+def resolve_love_key(name):
+    name = name.strip().lower()
+    code = KEY_MAP.get(name)
+    if code is None:
+        if name.startswith("0x"):
+            try:
+                code = int(name, 16)
+            except ValueError:
+                pass
+        elif name.isdigit():
+            code = int(name)
+    if code is None:
+        raise ValueError(f"unknown LÖVE key: {name}")
+    return code
+
+
+# ── Image / OCR helpers ──
+def _levenshtein(a, b):
+    n, m = len(a), len(b)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    prev = list(range(m + 1))
+    curr = [0] * (m + 1)
+    for i in range(1, n + 1):
+        curr[0] = i
+        for j in range(1, m + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev, curr = curr, prev
+    return prev[m]
+
+
+def _image_hash(path):
+    from PIL import Image
+    im = Image.open(path)
+    thumb = im.convert("L").resize((32, 32), Image.LANCZOS)
+    return hashlib.md5(thumb.tobytes()).hexdigest()
+
+
+def _words_to_lines(words):
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (w["y"], w["x"]))
+    lines = []
+    current = [sorted_words[0]]
+    for w in sorted_words[1:]:
+        avg_h = sum(x["h"] for x in current) / len(current)
+        if abs(w["y"] - current[-1]["y"]) <= avg_h * 0.75:
+            current.append(w)
+        else:
+            lines.append(current)
+            current = [w]
+    lines.append(current)
+    result = []
+    for line in lines:
+        line.sort(key=lambda w: w["x"])
+        result.append(" ".join(w["text"] for w in line))
+    return result
+
+
+def _closest_text_words(words, target, n=3):
+    target = target.strip().lower()
+    candidates = []
+    for w in words:
+        text = w["text"].lower()
+        dist = _levenshtein(target, text)
+        candidates.append((dist, w["text"], w))
+    candidates.sort(key=lambda x: x[0])
+    seen = set()
+    results = []
+    for dist, text, w in candidates:
+        if text not in seen:
+            seen.add(text)
+            results.append({"text": w["text"], "dist": dist, "x": w["x"], "y": w["y"]})
+        if len(results) >= n:
+            break
+    return results
+
+
+def _closest_color_info(img_path, color):
+    from PIL import Image
+    r, g, b = color
+    im = Image.open(img_path)
+    px = im.load()
+    best_dist = float("inf")
+    best = None
+    for iy in range(im.height):
+        for ix in range(im.width):
+            pr, pg, pb = px[ix, iy][:3]
+            d = ((pr - r) ** 2 + (pg - g) ** 2 + (pb - b) ** 2) ** 0.5
+            if d < best_dist:
+                best_dist = d
+                best = {"color": [pr, pg, pb], "dist": round(d, 2), "x": ix, "y": iy}
+    return best
+
+
+def _preprocess_for_ocr(img_path):
+    from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+    im = Image.open(img_path)
+    gray = im.convert("L")
+    pixels = list(gray.getdata())
+    mean = sum(pixels) / len(pixels)
+    if mean < 96:
+        gray = ImageOps.invert(gray)
+    enhancer = ImageEnhance.Contrast(gray)
+    high_contrast = enhancer.enhance(2.0)
+    binary = high_contrast.point(lambda p: 255 if p > 128 else 0, mode="1")
+    binary = binary.filter(ImageFilter.MinFilter(3))
+    binary = binary.filter(ImageFilter.MaxFilter(3))
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    binary.convert("L").save(path)
+    return path
+
+
+def _ocr_words(img_path, upscale=False, conf_min=0, preprocess=False, psm=None):
+    actual_path = img_path
+    preprocessed_path = None
+    upscaled_path = None
+    if preprocess:
+        preprocessed_path = _preprocess_for_ocr(img_path)
+        actual_path = preprocessed_path
+    if upscale:
+        from PIL import Image
+        im = Image.open(actual_path)
+        w2, h2 = im.width * 2, im.height * 2
+        im_up = im.resize((w2, h2), Image.LANCZOS)
+        fd, upscaled_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        im_up.save(upscaled_path)
+        actual_path = upscaled_path
+    tesseract_args = ["tesseract", actual_path, "stdout", "tsv"]
+    if psm is not None:
+        tesseract_args.extend(["--psm", str(psm)])
+    stdout, err, _ = run(tesseract_args, check=False, timeout=15)
+    if upscaled_path:
+        try:
+            os.unlink(upscaled_path)
+        except OSError:
+            pass
+    if preprocessed_path:
+        try:
+            os.unlink(preprocessed_path)
+        except OSError:
+            pass
+    if err:
+        fail("cmd_failed", f"tesseract failed: {err}", EXIT_CMD_FAILED)
+    words = []
+    for line in stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 12 and parts[0].isdigit() and int(parts[0]) == 5:
+            conf = parts[10] if len(parts) > 10 else "0"
+            try:
+                conf_val = float(conf)
+            except ValueError:
+                conf_val = 0.0
+            if conf_val < conf_min:
+                continue
+            w = {
+                "text": parts[11] if len(parts) > 11 else "",
+                "x": int(parts[6]),
+                "y": int(parts[7]),
+                "w": int(parts[8]),
+                "h": int(parts[9]),
+                "conf": conf_val,
+            }
+            if upscale:
+                w["x"] //= 2
+                w["y"] //= 2
+                w["w"] //= 2
+                w["h"] //= 2
+            words.append(w)
+    return words
+
+
+def _find_text_target(words, target, exact=False, all_matches=False, conf_min=0):
+    target = target.strip()
+    target_lc = target.lower()
+    matches = []
+    filtered = [w for w in words if w.get("conf", 100) >= conf_min]
+    for w in filtered:
+        if exact:
+            if w["text"] == target:
+                matches.append((w["x"] + w["w"] // 2, w["y"] + w["h"] // 2, w))
+        else:
+            if target_lc in w["text"].lower():
+                matches.append((w["x"] + w["w"] // 2, w["y"] + w["h"] // 2, w))
+    if not exact and " " in target and filtered:
+        sorted_words = sorted(filtered, key=lambda w: (w["y"], w["x"]))
+        lines = []
+        current = [sorted_words[0]]
+        for w in sorted_words[1:]:
+            avg_h = sum(x["h"] for x in current) / len(current)
+            if abs(w["y"] - current[-1]["y"]) <= avg_h * 0.75:
+                current.append(w)
+            else:
+                lines.append(current)
+                current = [w]
+        lines.append(current)
+        for line in lines:
+            line.sort(key=lambda w: w["x"])
+            joined = " ".join(w["text"] for w in line)
+            if target_lc in joined.lower():
+                x_min = min(w["x"] for w in line)
+                x_max = max(w["x"] + w["w"] for w in line)
+                y_min = min(w["y"] for w in line)
+                y_max = max(w["y"] + w["h"] for w in line)
+                synthetic = {
+                    "text": joined,
+                    "x": x_min,
+                    "y": y_min,
+                    "w": x_max - x_min,
+                    "h": y_max - y_min,
+                    "conf": min(w.get("conf", 100) for w in line),
+                }
+                matches.append(((x_min + x_max) // 2, (y_min + y_max) // 2, synthetic))
+    if not matches:
+        return [] if all_matches else None
+    matches.sort(key=lambda m: (m[1], m[0]))
+    return matches if all_matches else matches[0]
+
+
+def _find_color_target(img_path, color, tolerance=0):
+    from PIL import Image
+    im = Image.open(img_path)
+    px = im.load()
+    r, g, b = color
+    best = None
+    best_dist = None
+    for iy in range(im.height):
+        for ix in range(im.width):
+            pr, pg, pb = px[ix, iy][:3]
+            if tolerance == 0:
+                if pr == r and pg == g and pb == b:
+                    return ix, iy
+            else:
+                d = ((pr - r) ** 2 + (pg - g) ** 2 + (pb - b) ** 2) ** 0.5
+                if d <= tolerance:
+                    if best_dist is None or d < best_dist:
+                        best_dist = d
+                        best = (ix, iy)
+    return best
+
+
+def _find_all_color_targets(img_path, color, tolerance):
+    from PIL import Image
+    im = Image.open(img_path)
+    px = im.load()
+    r, g, b = color
+    cell = 20
+    grid = {}
+    for iy in range(im.height):
+        for ix in range(im.width):
+            pr, pg, pb = px[ix, iy][:3]
+            d = ((pr - r) ** 2 + (pg - g) ** 2 + (pb - b) ** 2) ** 0.5
+            if d <= tolerance:
+                gx, gy = ix // cell, iy // cell
+                if (gx, gy) not in grid:
+                    grid[(gx, gy)] = [0, 0, 0]
+                grid[(gx, gy)][0] += ix
+                grid[(gx, gy)][1] += iy
+                grid[(gx, gy)][2] += 1
+    centers = []
+    for (gx, gy), (sx, sy, c) in grid.items():
+        centers.append((int(sx / c), int(sy / c), c))
+    centers.sort(key=lambda m: (m[1], m[0]))
+    return centers
+
+
+# ── Screenshot ──
+def _scoped_snap(geo, scope, scale=1.0):
+    if scope:
+        x = geo["at"][0] + int(scope["x"] / scale)
+        y = geo["at"][1] + int(scope["y"] / scale)
+        w = int(scope["w"] / scale)
+        h = int(scope["h"] / scale)
+    else:
+        x = geo["at"][0]
+        y = geo["at"][1]
+        w = geo["size"][0]
+        h = geo["size"][1]
+    region = f"{x},{y} {w}x{h}"
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    hide_cursor_for_screenshot()
+    stdout, err, _ = run(["grim", "-g", region, path], check=False, timeout=10)
+    unhide_cursor_after_screenshot()
+    if err:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        fail("cmd_failed", f"grim failed: {err}", EXIT_CMD_FAILED)
+    return path
+
+
+def _verify_change(geo, scope, before_path, scale=1.0):
+    if before_path is None:
+        return None
+    after_path = _scoped_snap(geo, scope, scale)
+    changed = _image_hash(before_path) != _image_hash(after_path)
+    for p in (before_path, after_path):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    return changed
+
+
+# ── ydotool ──
+def _ydotool(extra_args):
+    stdout, err, rc = run(["ydotool"] + extra_args, check=False, timeout=10)
+    if rc != 0:
+        return err or f"ydotool exited with code {rc}"
+    if err and "failed" in err.lower():
+        return err
+    return None
+
+
+# ── Argument parsers ──
+def parse_pos(s):
+    try:
+        x, y = map(int, s.split(","))
+        return x, y
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid position '{s}', expected x,y")
+
+
+def parse_color(s):
+    try:
+        parts = s.replace(",", " ").split()
+        if len(parts) != 3:
+            raise ValueError
+        r, g, b = map(int, parts)
+        if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
+            raise ValueError
+        return r, g, b
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid color '{s}', expected r,g,b (0-255)")
+
+
+def parse_coords(s):
+    try:
+        parts = s.replace(",", " ").split()
+        if len(parts) != 4:
+            raise ValueError
+        return tuple(map(int, parts))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid coords '{s}', expected x1 y1 x2 y2")
+
+
+# ── Window helper for pipeline ──
+def _require_window(state):
+    address = state.get("address")
+    if address:
+        stdout, err, _ = run(["hyprctl", "clients", "-j"], check=False, timeout=5)
+        if stdout:
+            try:
+                clients = json.loads(stdout)
+            except json.JSONDecodeError:
+                clients = []
+            for c in clients:
+                if c.get("address") == address:
+                    cls = c.get("class", "") or ""
+                    initial = c.get("initialClass", "") or ""
+                    if cls == "love" or initial == "love":
+                        state["geometry"] = {"x": c["at"][0], "y": c["at"][1], "w": c["size"][0], "h": c["size"][1]}
+                        state["monitor"] = c.get("monitor", 0)
+                        return c
+    win = find_love_window(max_wait=POLL_TIMEOUT)
+    if win is None:
+        fail("no_window", "No LÖVE window found", EXIT_NO_WINDOW)
+    state["address"] = win.get("address")
+    state["geometry"] = {"x": win["at"][0], "y": win["at"][1], "w": win["size"][0], "h": win["size"][1]}
+    state["monitor"] = win.get("monitor", 0)
+    state["title"] = win.get("title")
+    return win
+
+
+def _resolve_pos(args, state, attr_name):
+    val = getattr(args, attr_name, None)
+    if val is not None:
+        return val
+    x = state.get("x")
+    y = state.get("y")
+    if x is not None and y is not None:
+        return x, y
+    return None, None
+
+
+def _resolve_relative_pos(px, py, scope, relative):
+    if relative:
+        if scope is None:
+            fail("no_scope", "--relative used but no scope is active", EXIT_BAD_ARGS)
+        return px + scope["x"], py + scope["y"]
+    return px, py
+
+
+# ═════════════════════════════════════════════════════════════════
+#  Atomic Commands
+# ═════════════════════════════════════════════════════════════════
+class Command:
+    NAME = None
+
+    @classmethod
+    def add_parser(cls, subparsers):
+        p = subparsers.add_parser(cls.NAME, help=cls.__doc__)
+        cls.configure(p)
+        return p
+
+    @classmethod
+    def configure(cls, parser):
+        pass
+
+    def run(self, args, state):
+        raise NotImplementedError
+
+
+class CmdWindow(Command):
+    NAME = "window"
+    """Find the LÖVE window and output geometry."""
+
+    def run(self, args, state):
+        win = find_love_window(max_wait=POLL_TIMEOUT)
+        if win is None:
+            fail("no_window", "No LÖVE window found", EXIT_NO_WINDOW)
+        scale = get_monitor_scale(win.get("monitor", 0))
+        factor = get_ydotool_factor()
+        state.update({
+            "ok": True,
+            "running": True,
+            "pid": win.get("pid"),
+            "title": win.get("title"),
+            "address": win.get("address"),
+            "monitor": win.get("monitor"),
+            "workspace": win.get("workspace"),
+            "focused": win.get("focused"),
+            "geometry": {
+                "x": win["at"][0],
+                "y": win["at"][1],
+                "w": win["size"][0],
+                "h": win["size"][1],
+            },
+            "screenshot": {
+                "w": int(win["size"][0] * scale),
+                "h": int(win["size"][1] * scale),
+            },
+            "scale": scale,
+            "ydotool_factor": factor,
+        })
+        return state
+
+
+class CmdFocus(Command):
+    NAME = "focus"
+    """Focus the LÖVE window."""
+
+    def run(self, args, state):
+        address = state.get("address")
+        if not address:
+            win = _require_window(state)
+            address = win["address"]
+        focus_window(address)
+        state["ok"] = True
+        state["focused"] = True
+        return state
+
+
+class CmdSnap(Command):
+    NAME = "snap"
+    """Screenshot the LÖVE window (or scoped region)."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--path", type=str, help="Save path (temp if omitted)")
+        parser.add_argument("--no-scope", action="store_true", help="Ignore active scope")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        scope = get_scope() if not args.no_scope else None
+        img_path = _scoped_snap(geo, scope, scale)
+        if args.path:
+            out_path = Path(args.path).expanduser().resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(img_path, out_path)
+            img_path = str(out_path)
+        if scope:
+            out_geo = {
+                "x": scope["x"],
+                "y": scope["y"],
+                "w": scope["w"],
+                "h": scope["h"],
+            }
+        else:
+            out_geo = {
+                "x": 0,
+                "y": 0,
+                "w": int(geo["size"][0] * scale),
+                "h": int(geo["size"][1] * scale),
+            }
+        state.update({"ok": True, "path": img_path, "shot": out_geo, "scale": scale})
+        return state
+
+
+class CmdOcr(Command):
+    NAME = "ocr"
+    """Run OCR on an image and output words."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--path", type=str, help="Image path (or from stdin 'path')")
+        parser.add_argument("--upscale", action="store_true")
+        parser.add_argument("--preprocess", action="store_true", help="Binarize and denoise before OCR")
+        parser.add_argument("--psm", type=int, help="Tesseract page segmentation mode (6=block, 7=line, 11=sparse, 13=raw)")
+        parser.add_argument("--conf-min", type=float, default=0)
+
+    def run(self, args, state):
+        path = args.path or state.get("path")
+        if not path:
+            fail("bad_args", "ocr requires --path or stdin with 'path'", EXIT_BAD_ARGS)
+        words = _ocr_words(path, upscale=args.upscale, conf_min=args.conf_min, preprocess=args.preprocess, psm=args.psm)
+        state.update({"ok": True, "words": words, "path": path})
+        return state
+
+
+class CmdFindText(Command):
+    NAME = "find-text"
+    """Find text coordinates in OCR word data."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--text", type=str, required=True)
+        parser.add_argument("--exact", action="store_true")
+        parser.add_argument("--all", action="store_true")
+        parser.add_argument("--conf-min", type=float, default=0)
+        parser.add_argument("--save-scope", action="store_true")
+        parser.add_argument("--padding", type=int, default=10)
+
+    def run(self, args, state):
+        words = state.get("words")
+        if words is None:
+            fail("bad_args", "find-text requires stdin with 'words'", EXIT_BAD_ARGS)
+        found = _find_text_target(words, args.text, exact=args.exact, all_matches=args.all, conf_min=args.conf_min)
+        if args.all:
+            if not found:
+                closest = _closest_text_words(words, args.text)
+                fail("not_found", f"Text '{args.text}' not found", EXIT_NOT_FOUND, extra={"closest": closest})
+            matches = []
+            for (cx, cy, w) in found:
+                entry = {"x": cx, "y": cy, "text": w["text"], "conf": w.get("conf", 0), "w": w["w"], "h": w["h"]}
+                if args.save_scope:
+                    padding = args.padding
+                    entry["scope"] = {
+                        "x": max(0, cx - w["w"] // 2 - padding),
+                        "y": max(0, cy - w["h"] // 2 - padding),
+                        "w": w["w"] + padding * 2,
+                        "h": w["h"] + padding * 2,
+                    }
+                    set_scope(entry["scope"])
+                matches.append(entry)
+            state.update({"ok": True, "matches": matches})
+        else:
+            if found is None:
+                closest = _closest_text_words(words, args.text)
+                fail("not_found", f"Text '{args.text}' not found", EXIT_NOT_FOUND, extra={"closest": closest})
+            cx, cy, w = found
+            entry = {"ok": True, "x": cx, "y": cy, "text": w["text"], "conf": w.get("conf", 0), "w": w["w"], "h": w["h"]}
+            if args.save_scope:
+                padding = args.padding
+                entry["scope"] = {
+                    "x": max(0, cx - w["w"] // 2 - padding),
+                    "y": max(0, cy - w["h"] // 2 - padding),
+                    "w": w["w"] + padding * 2,
+                    "h": w["h"] + padding * 2,
+                }
+                set_scope(entry["scope"])
+            state.update(entry)
+        return state
+
+
+class CmdFindColor(Command):
+    NAME = "find-color"
+    """Find pixel coordinates of a color in an image."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--color", type=parse_color, required=True)
+        parser.add_argument("--tolerance", type=int, default=0)
+        parser.add_argument("--path", type=str, help="Image path (or from stdin 'path')")
+        parser.add_argument("--save-scope", action="store_true")
+        parser.add_argument("--padding", type=int, default=10)
+
+    def run(self, args, state):
+        path = args.path or state.get("path")
+        if not path:
+            fail("bad_args", "find-color requires --path or stdin with 'path'", EXIT_BAD_ARGS)
+        found = _find_color_target(path, args.color, args.tolerance)
+        if found is None:
+            closest = _closest_color_info(path, args.color)
+            fail("not_found", f"Color {args.color} not found", EXIT_NOT_FOUND, extra={"closest": closest})
+        x, y = found
+        entry = {"ok": True, "x": x, "y": y, "color": list(args.color)}
+        if args.save_scope:
+            padding = args.padding
+            entry["scope"] = {
+                "x": max(0, x - padding),
+                "y": max(0, y - padding),
+                "w": 1 + padding * 2,
+                "h": 1 + padding * 2,
+            }
+            set_scope(entry["scope"])
+        state.update(entry)
+        return state
+
+
+class CmdLines(Command):
+    NAME = "lines"
+    """Group OCR words into lines or plain text."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--as-text", action="store_true")
+        parser.add_argument("--compact", action="store_true")
+
+    def run(self, args, state):
+        words = state.get("words")
+        if words is None:
+            fail("bad_args", "lines requires stdin with 'words'", EXIT_BAD_ARGS)
+        lines = _words_to_lines(words)
+        if args.as_text:
+            state.update({"ok": True, "text": "\n".join(lines)})
+        elif args.compact:
+            state.update({"ok": True, "lines": lines})
+        else:
+            state.update({"ok": True, "lines": lines, "words": words})
+        return state
+
+
+class CmdMove(Command):
+    NAME = "move"
+    """Move cursor to window-relative coordinates."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--pos", type=parse_pos, help="x,y")
+        parser.add_argument("--relative", action="store_true")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        factor = get_ydotool_factor()
+        focus_window(win["address"])
+        scope = get_scope()
+        px, py = _resolve_pos(args, state, "pos")
+        if px is None or py is None:
+            fail("bad_args", "move requires --pos x,y or stdin with x,y", EXIT_BAD_ARGS)
+        px, py = _resolve_relative_pos(px, py, scope, args.relative)
+        hx, hy = window_pixels_to_hypr(geo["at"][0], geo["at"][1], px, py, scale)
+        yx, yy = hypr_to_ydotool(hx, hy, factor)
+        err = _ydotool(["mousemove", "-a", "-x", str(yx), "-y", str(yy)])
+        if err:
+            fail("cmd_failed", f"ydotool mousemove failed: {err}", EXIT_CMD_FAILED)
+        state.update({"ok": True, "x": px, "y": py, "hypr": {"x": hx, "y": hy}, "ydotool": {"x": yx, "y": yy}})
+        return state
+
+
+class CmdClick(Command):
+    NAME = "click"
+    """Click at window-relative coordinates."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--pos", type=parse_pos, help="x,y")
+        parser.add_argument("--relative", action="store_true")
+        parser.add_argument("--button", choices=["left", "right", "middle"], default="left")
+        parser.add_argument("--duration", type=int, help="Hold duration in ms")
+        parser.add_argument("--offset", type=parse_pos, default=(0, 0))
+        parser.add_argument("--verify", action="store_true")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        factor = get_ydotool_factor()
+        focus_window(win["address"])
+        scope = get_scope()
+        px, py = _resolve_pos(args, state, "pos")
+        if px is None or py is None:
+            fail("bad_args", "click requires --pos x,y or stdin with x,y", EXIT_BAD_ARGS)
+        px, py = _resolve_relative_pos(px, py, scope, args.relative)
+        ox, oy = args.offset
+        px += ox
+        py += oy
+        hx, hy = window_pixels_to_hypr(geo["at"][0], geo["at"][1], px, py, scale)
+        yx, yy = hypr_to_ydotool(hx, hy, factor)
+        verify = args.verify
+        if verify:
+            hide_cursor_for_screenshot()
+        before_path = None
+        try:
+            if verify:
+                before_path = _scoped_snap(geo, scope, scale)
+            err = _ydotool(["mousemove", "-a", "-x", str(yx), "-y", str(yy)])
+            if err:
+                fail("cmd_failed", f"ydotool mousemove failed: {err}", EXIT_CMD_FAILED)
+            btn = MOUSE_BUTTONS.get(args.button, MOUSE_BUTTONS["left"])
+            if args.duration is not None and args.duration > 0:
+                err = _ydotool(["click", btn["down"]])
+                if err:
+                    fail("cmd_failed", f"ydotool click down failed: {err}", EXIT_CMD_FAILED)
+                time.sleep(args.duration / 1000.0)
+                err = _ydotool(["click", btn["up"]])
+                if err:
+                    fail("cmd_failed", f"ydotool click up failed: {err}", EXIT_CMD_FAILED)
+            else:
+                err = _ydotool(["click", btn["click"]])
+                if err:
+                    fail("cmd_failed", f"ydotool click failed: {err}", EXIT_CMD_FAILED)
+            changed = _verify_change(geo, scope, before_path, scale)
+            out = {"ok": True, "x": px, "y": py, "hypr": {"x": hx, "y": hy}, "ydotool": {"x": yx, "y": yy}}
+            if changed is not None:
+                out["changed"] = changed
+            state.update(out)
+            return state
+        finally:
+            if verify:
+                unhide_cursor_after_screenshot()
+
+
+class CmdDrag(Command):
+    NAME = "drag"
+    """Drag from one point to another."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--from", dest="from_pos", type=parse_pos)
+        parser.add_argument("--to", dest="to_pos", type=parse_pos)
+        parser.add_argument("--duration", type=int, default=500)
+        parser.add_argument("--button", choices=["left", "right", "middle"], default="left")
+        parser.add_argument("--relative", action="store_true")
+        parser.add_argument("--verify", action="store_true")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        factor = get_ydotool_factor()
+        focus_window(win["address"])
+        scope = get_scope()
+        x1, y1 = _resolve_pos(args, state, "from_pos")
+        x2, y2 = _resolve_pos(args, state, "to_pos")
+        if None in (x1, y1, x2, y2):
+            if args.from_pos and state.get("x") is not None:
+                x1, y1 = args.from_pos
+                x2, y2 = state["x"], state["y"]
+            else:
+                fail("bad_args", "drag requires --from and --to (or stdin x,y as destination with --from)", EXIT_BAD_ARGS)
+        x1, y1 = _resolve_relative_pos(x1, y1, scope, args.relative)
+        x2, y2 = _resolve_relative_pos(x2, y2, scope, args.relative)
+        hx1, hy1 = window_pixels_to_hypr(geo["at"][0], geo["at"][1], x1, y1, scale)
+        hx2, hy2 = window_pixels_to_hypr(geo["at"][0], geo["at"][1], x2, y2, scale)
+        yx1, yy1 = hypr_to_ydotool(hx1, hy1, factor)
+        yx2, yy2 = hypr_to_ydotool(hx2, hy2, factor)
+        verify = args.verify
+        if verify:
+            hide_cursor_for_screenshot()
+        before_path = None
+        try:
+            if verify:
+                before_path = _scoped_snap(geo, scope, scale)
+            err = _ydotool(["mousemove", "-a", "-x", str(yx1), "-y", str(yy1)])
+            if err:
+                fail("cmd_failed", f"ydotool mousemove failed: {err}", EXIT_CMD_FAILED)
+            btn = MOUSE_BUTTONS.get(args.button, MOUSE_BUTTONS["left"])
+            err = _ydotool(["click", btn["down"]])
+            if err:
+                fail("cmd_failed", f"ydotool click down failed: {err}", EXIT_CMD_FAILED)
+            duration = args.duration
+            steps = max(2, min(10, int(duration / 50)))
+            for i in range(1, steps + 1):
+                t = i / steps
+                hx = int(hx1 + (hx2 - hx1) * t)
+                hy = int(hy1 + (hy2 - hy1) * t)
+                yx, yy = hypr_to_ydotool(hx, hy, factor)
+                err = _ydotool(["mousemove", "-a", "-x", str(yx), "-y", str(yy)])
+                if err:
+                    _ydotool(["click", btn["up"]])
+                    fail("cmd_failed", f"ydotool mousemove failed during drag: {err}", EXIT_CMD_FAILED)
+                time.sleep(duration / 1000.0 / steps)
+            err = _ydotool(["click", btn["up"]])
+            if err:
+                fail("cmd_failed", f"ydotool click up failed: {err}", EXIT_CMD_FAILED)
+            changed = _verify_change(geo, scope, before_path, scale)
+            out = {"ok": True, "from": {"x": x1, "y": y1}, "to": {"x": x2, "y": y2}}
+            if changed is not None:
+                out["changed"] = changed
+            state.update(out)
+            return state
+        finally:
+            if verify:
+                unhide_cursor_after_screenshot()
+
+
+class CmdKey(Command):
+    NAME = "key"
+    """Press keys simultaneously."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("keys", nargs="+", help="LÖVE key names")
+        parser.add_argument("--verify", action="store_true")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        focus_window(win["address"])
+        verify = args.verify
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        scope = get_scope()
+        if verify:
+            hide_cursor_for_screenshot()
+        before_path = None
+        try:
+            if verify:
+                before_path = _scoped_snap(geo, scope, scale)
+            codes = []
+            for n in args.keys:
+                try:
+                    codes.append(resolve_love_key(n))
+                except ValueError as e:
+                    fail("bad_key", str(e))
+            seq = [f"{c}:1" for c in codes] + [f"{c}:0" for c in reversed(codes)]
+            err = _ydotool(["key"] + seq)
+            if err:
+                fail("cmd_failed", f"ydotool key failed: {err}", EXIT_CMD_FAILED)
+            changed = _verify_change(geo, scope, before_path, scale)
+            out = {"ok": True, "keys": args.keys}
+            if changed is not None:
+                out["changed"] = changed
+            state.update(out)
+            return state
+        finally:
+            if verify:
+                unhide_cursor_after_screenshot()
+
+
+class CmdType(Command):
+    NAME = "type"
+    """Type literal text."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("text", help="Text to type")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        focus_window(win["address"])
+        err = _ydotool(["type", args.text])
+        if err:
+            fail("cmd_failed", f"ydotool type failed: {err}", EXIT_CMD_FAILED)
+        state.update({"ok": True, "text": args.text})
+        return state
+
+
+class CmdScope(Command):
+    NAME = "scope"
+    """Get, set, or clear the active scope."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("action", choices=["get", "set", "clear"], nargs="?", default="get")
+        parser.add_argument("--coords", type=parse_coords, help="x1 y1 x2 y2")
+        parser.add_argument("--text", type=str)
+        parser.add_argument("--exact-text", action="store_true")
+        parser.add_argument("--color", type=parse_color)
+        parser.add_argument("--tolerance", type=int, default=0)
+        parser.add_argument("--padding", type=int, default=10)
+        parser.add_argument("--upscale", action="store_true")
+        parser.add_argument("--preprocess", action="store_true")
+        parser.add_argument("--psm", type=int)
+        parser.add_argument("--conf-min", type=float, default=0)
+
+    def run(self, args, state):
+        if args.action == "clear":
+            set_scope(None)
+            state.update({"ok": True, "scope": None})
+            return state
+        if args.action == "get":
+            scope = get_scope()
+            state.update({"ok": True, "scope": scope})
+            return state
+        if args.action == "set":
+            if args.coords is not None:
+                x1, y1, x2, y2 = args.coords
+                x = min(x1, x2)
+                y = min(y1, y2)
+                w = abs(x2 - x1)
+                h = abs(y2 - y1)
+                scope = {"x": x, "y": y, "w": w, "h": h}
+                set_scope(scope)
+                state.update({"ok": True, "scope": scope})
+                return state
+            if args.text is not None or args.color is not None:
+                win = _require_window(state)
+                geo = {"at": win["at"], "size": win["size"]}
+                img_path = _scoped_snap(geo, None)
+                padding = args.padding
+                if args.text is not None:
+                    words = _ocr_words(img_path, upscale=args.upscale, conf_min=args.conf_min, preprocess=args.preprocess, psm=args.psm)
+                    found = _find_text_target(words, args.text, args.exact_text)
+                    os.unlink(img_path)
+                    if found is None:
+                        closest = _closest_text_words(words, args.text)
+                        fail("not_found", f"Text '{args.text}' not found", EXIT_NOT_FOUND, extra={"closest": closest})
+                    img_x, img_y, w = found
+                    scope = {
+                        "x": max(0, img_x - w["w"] // 2 - padding),
+                        "y": max(0, img_y - w["h"] // 2 - padding),
+                        "w": w["w"] + padding * 2,
+                        "h": w["h"] + padding * 2,
+                    }
+                else:
+                    found = _find_color_target(img_path, args.color, args.tolerance)
+                    os.unlink(img_path)
+                    if found is None:
+                        closest = _closest_color_info(img_path, args.color)
+                        fail("not_found", f"Color {args.color} not found", EXIT_NOT_FOUND, extra={"closest": closest})
+                    img_x, img_y = found
+                    scope = {
+                        "x": max(0, img_x - padding),
+                        "y": max(0, img_y - padding),
+                        "w": 1 + padding * 2,
+                        "h": 1 + padding * 2,
+                    }
+                set_scope(scope)
+                state.update({"ok": True, "scope": scope})
+                return state
+            x = state.get("x")
+            y = state.get("y")
+            w = state.get("w")
+            h = state.get("h")
+            if None in (x, y, w, h):
+                fail("bad_args", "scope set requires --coords, --text, --color, or stdin with x,y,w,h", EXIT_BAD_ARGS)
+            scope = {"x": x, "y": y, "w": w, "h": h}
+            set_scope(scope)
+            state.update({"ok": True, "scope": scope})
+            return state
+
+
+# ═════════════════════════════════════════════════════════════════
+#  Composite / Convenience Commands
+# ═════════════════════════════════════════════════════════════════
+class CmdRead(Command):
+    NAME = "read"
+    """Convenience: screenshot, OCR, and return text."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--no-scope", action="store_true")
+        parser.add_argument("--upscale", action="store_true")
+        parser.add_argument("--preprocess", action="store_true")
+        parser.add_argument("--psm", type=int)
+        parser.add_argument("--compact", action="store_true")
+        parser.add_argument("--as-text", action="store_true")
+
+    def run(self, args, state):
+        if "path" not in state:
+            snap_ns = argparse.Namespace(no_scope=args.no_scope, path=None)
+            state = CmdSnap().run(snap_ns, state)
+        ocr_ns = argparse.Namespace(path=None, upscale=args.upscale, conf_min=0, preprocess=args.preprocess, psm=args.psm)
+        state = CmdOcr().run(ocr_ns, state)
+        lines_ns = argparse.Namespace(as_text=args.as_text, compact=args.compact)
+        state = CmdLines().run(lines_ns, state)
+        return state
+
+
+class CmdChain(Command):
+    NAME = "chain"
+    """Run a sequence of commands, passing state between them."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--step", action="append", help="Command string to run")
+        parser.add_argument("--no-focus", action="store_true", help="Skip focusing the LÖVE window at chain start")
+
+    def run(self, args, state):
+        if not args.step:
+            fail("bad_args", "chain requires at least one --step", EXIT_BAD_ARGS)
+        if not args.no_focus:
+            win = _require_window(state)
+            focus_window(win["address"])
+        registry = get_command_registry()
+        for step in args.step:
+            parts = step.strip().split()
+            if not parts:
+                continue
+            cmd_name = parts[0]
+            cmd_cls = registry.get(cmd_name)
+            if cmd_cls is None:
+                fail("bad_args", f"Unknown command in chain: {cmd_name}", EXIT_BAD_ARGS)
+            sub_parser = argparse.ArgumentParser(prog=f"love-control {cmd_name}", add_help=False)
+            cmd_cls.configure(sub_parser)
+            try:
+                sub_args = sub_parser.parse_args(parts[1:])
+            except SystemExit:
+                fail("bad_args", f"Invalid arguments for chain step: {step}", EXIT_BAD_ARGS)
+            cmd = cmd_cls()
+            state = cmd.run(sub_args, state)
+        state["ok"] = True
+        return state
+
+
+class CmdWait(Command):
+    NAME = "wait"
+    """Poll until a condition is met or timeout."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--timeout", type=int, default=5000)
+        parser.add_argument("--step", action="append", help="Chain step to poll")
+        parser.add_argument("--text", type=str)
+        parser.add_argument("--exact-text", action="store_true")
+        parser.add_argument("--color", type=parse_color)
+        parser.add_argument("--tolerance", type=int, default=0)
+        parser.add_argument("--no-scope", action="store_true")
+        parser.add_argument("--upscale", action="store_true")
+        parser.add_argument("--preprocess", action="store_true")
+        parser.add_argument("--psm", type=int)
+        parser.add_argument("--conf-min", type=float, default=0)
+
+    def run(self, args, state):
+        timeout = args.timeout
+        end = time.time() + timeout / 1000.0
+        if args.step:
+            chain_cmd = CmdChain()
+            chain_ns = argparse.Namespace(step=args.step)
+            while time.time() < end:
+                try:
+                    tmp_state = dict(state)
+                    tmp_state = chain_cmd.run(chain_ns, tmp_state)
+                    state.update(tmp_state)
+                    return state
+                except LoveControlError:
+                    pass
+                time.sleep(POLL_INTERVAL)
+            fail("timeout", "Wait condition not met within timeout", EXIT_TIMEOUT)
+        elif args.text is not None or args.color is not None:
+            win = _require_window(state)
+            geo = {"at": win["at"], "size": win["size"]}
+            scale = get_monitor_scale(win.get("monitor", 0))
+            scope = get_scope() if not args.no_scope else None
+            while time.time() < end:
+                img_path = _scoped_snap(geo, scope, scale)
+                found = False
+                if args.text is not None:
+                    words = _ocr_words(img_path, upscale=args.upscale, conf_min=args.conf_min, preprocess=args.preprocess, psm=args.psm)
+                    found = _find_text_target(words, args.text, args.exact_text) is not None
+                else:
+                    found = _find_color_target(img_path, args.color, args.tolerance) is not None
+                try:
+                    os.unlink(img_path)
+                except OSError:
+                    pass
+                if found:
+                    state.update({"ok": True, "found": True})
+                    return state
+                time.sleep(POLL_INTERVAL)
+            fail("timeout", "Wait condition not met within timeout", EXIT_TIMEOUT)
+        else:
+            fail("bad_args", "wait requires --step, --text, or --color", EXIT_BAD_ARGS)
+
+
+class CmdAssert(Command):
+    NAME = "assert"
+    """Assert that state contains expected fields/values."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--has", action="append", help="Require field existence")
+        parser.add_argument("--eq", action="append", help="field=value")
+
+    def run(self, args, state):
+        if args.has:
+            for field in args.has:
+                if field not in state:
+                    fail("assert_failed", f"Assertion failed: missing field '{field}'", EXIT_GENERAL)
+        if args.eq:
+            for pair in args.eq:
+                if "=" not in pair:
+                    fail("bad_args", "--eq requires field=value", EXIT_BAD_ARGS)
+                field, val = pair.split("=", 1)
+                if str(state.get(field)) != val:
+                    fail("assert_failed", f"Assertion failed: {field} != {val}", EXIT_GENERAL)
+        state.update({"ok": True, "assert": True})
+        return state
+
+
+# ═════════════════════════════════════════════════════════════════
+#  Wishlist Convenience Commands
+# ═════════════════════════════════════════════════════════════════
+class CmdClickText(Command):
+    NAME = "click-text"
+    """Convenience: screenshot, OCR, find text, and click it."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--text", type=str, required=True)
+        parser.add_argument("--exact", action="store_true")
+        parser.add_argument("--upscale", action="store_true")
+        parser.add_argument("--preprocess", action="store_true")
+        parser.add_argument("--psm", type=int)
+        parser.add_argument("--conf-min", type=float, default=0)
+        parser.add_argument("--save-scope", action="store_true")
+        parser.add_argument("--padding", type=int, default=10)
+        parser.add_argument("--timeout", type=int, default=5000)
+        parser.add_argument("--verify", action="store_true")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        focus_window(win["address"])
+        scope = get_scope()
+        timeout = args.timeout
+        end = time.time() + timeout / 1000.0
+        found = None
+        words = []
+        img_path = None
+        while time.time() < end:
+            img_path = _scoped_snap(geo, scope, scale)
+            words = _ocr_words(img_path, upscale=args.upscale, conf_min=args.conf_min, preprocess=args.preprocess, psm=args.psm)
+            found = _find_text_target(words, args.text, exact=args.exact)
+            if found is not None:
+                break
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+            img_path = None
+            time.sleep(POLL_INTERVAL)
+        if found is None:
+            closest = _closest_text_words(words, args.text)
+            fail("not_found", f"Text '{args.text}' not found within {timeout}ms", EXIT_NOT_FOUND, extra={"closest": closest})
+        cx, cy, w = found
+        state["x"] = cx
+        state["y"] = cy
+        if args.save_scope:
+            padding = args.padding
+            entry = {
+                "scope": {
+                    "x": max(0, cx - w["w"] // 2 - padding),
+                    "y": max(0, cy - w["h"] // 2 - padding),
+                    "w": w["w"] + padding * 2,
+                    "h": w["h"] + padding * 2,
+                }
+            }
+            set_scope(entry["scope"])
+            state.update(entry)
+        click_ns = argparse.Namespace(
+            pos=(cx, cy),
+            relative=False,
+            button="left",
+            duration=None,
+            offset=(0, 0),
+            verify=args.verify,
+        )
+        state = CmdClick().run(click_ns, state)
+        if img_path:
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+        return state
+
+
+class CmdClickColor(Command):
+    NAME = "click-color"
+    """Convenience: screenshot, find color, and click it."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--color", type=parse_color, required=True)
+        parser.add_argument("--tolerance", type=int, default=30)
+        parser.add_argument("--all", action="store_true")
+        parser.add_argument("--index", type=int, default=0)
+        parser.add_argument("--save-scope", action="store_true")
+        parser.add_argument("--padding", type=int, default=10)
+        parser.add_argument("--timeout", type=int, default=5000)
+        parser.add_argument("--verify", action="store_true")
+
+    def run(self, args, state):
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        focus_window(win["address"])
+        scope = get_scope()
+        timeout = args.timeout
+        end = time.time() + timeout / 1000.0
+        found = None
+        all_matches = None
+        img_path = None
+        while time.time() < end:
+            img_path = _scoped_snap(geo, scope, scale)
+            if args.all:
+                all_matches = _find_all_color_targets(img_path, args.color, args.tolerance)
+                if all_matches and args.index < len(all_matches):
+                    found = all_matches[args.index][:2]
+                elif all_matches:
+                    found = all_matches[0][:2]
+            else:
+                found = _find_color_target(img_path, args.color, args.tolerance)
+            if found is not None:
+                break
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+            img_path = None
+            time.sleep(POLL_INTERVAL)
+        if found is None:
+            if img_path is None:
+                img_path = _scoped_snap(geo, scope, scale)
+            closest = _closest_color_info(img_path, args.color)
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+            fail("not_found", f"Color {args.color} not found within {timeout}ms", EXIT_NOT_FOUND, extra={"closest": closest})
+        x, y = found
+        state["x"] = x
+        state["y"] = y
+        if args.save_scope:
+            padding = args.padding
+            entry = {
+                "scope": {
+                    "x": max(0, x - padding),
+                    "y": max(0, y - padding),
+                    "w": 1 + padding * 2,
+                    "h": 1 + padding * 2,
+                }
+            }
+            set_scope(entry["scope"])
+            state.update(entry)
+        click_ns = argparse.Namespace(
+            pos=(x, y),
+            relative=False,
+            button="left",
+            duration=None,
+            offset=(0, 0),
+            verify=args.verify,
+        )
+        state = CmdClick().run(click_ns, state)
+        if img_path:
+            
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+        return state
+
+
+class CmdProbeColors(Command):
+    NAME = "probe-colors"
+    """Discover dominant colors in the current screenshot."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--count", type=int, default=10)
+        parser.add_argument("--exclude-bg", action="store_true")
+        parser.add_argument("--scope", action="store_true", help="Restrict to active scope region")
+        parser.add_argument("--tolerance", type=int, default=30)
+
+    def run(self, args, state):
+        from collections import Counter
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        scope = get_scope() if args.scope else None
+        img_path = _scoped_snap(geo, scope, scale)
+        from PIL import Image
+        im = Image.open(img_path)
+        small = im.resize((max(1, im.width // 4), max(1, im.height // 4)), Image.LANCZOS)
+        pixels = [p[:3] for p in small.getdata()]
+        if args.exclude_bg:
+            pixels = [p for p in pixels if not (all(c < 20 for c in p) or all(c > 235 for c in p))]
+        step = max(1, args.tolerance)
+        buckets = Counter()
+        for r, g, b in pixels:
+            qr = (r // step) * step
+            qg = (g // step) * step
+            qb = (b // step) * step
+            buckets[(qr, qg, qb)] += 1
+        top = buckets.most_common(args.count)
+        colors = []
+        for (r, g, b), count in top:
+            colors.append({
+                "rgb": [r, g, b],
+                "hex": f"{r:02x}{g:02x}{b:02x}",
+                "pixels": count * 16,
+            })
+        try:
+            os.unlink(img_path)
+        except OSError:
+            pass
+        state.update({"ok": True, "colors": colors})
+        return state
+
+
+class CmdWaitChain(Command):
+    NAME = "wait-chain"
+    """Wait for a condition, then run a chain atomically."""
+
+    @classmethod
+    def configure(cls, parser):
+        parser.add_argument("--wait-text", type=str)
+        parser.add_argument("--wait-color", type=parse_color)
+        parser.add_argument("--tolerance", type=int, default=0)
+        parser.add_argument("--timeout", type=int, default=5000)
+        parser.add_argument("--step", action="append")
+        parser.add_argument("--upscale", action="store_true")
+        parser.add_argument("--preprocess", action="store_true")
+        parser.add_argument("--psm", type=int)
+        parser.add_argument("--conf-min", type=float, default=0)
+        parser.add_argument("--no-scope", action="store_true")
+
+    def run(self, args, state):
+        if not args.step:
+            fail("bad_args", "wait-chain requires at least one --step", EXIT_BAD_ARGS)
+        timeout = args.timeout
+        end = time.time() + timeout / 1000.0
+        win = _require_window(state)
+        geo = {"at": win["at"], "size": win["size"]}
+        scale = get_monitor_scale(win.get("monitor", 0))
+        scope = get_scope() if not args.no_scope else None
+        found = False
+        while time.time() < end:
+            img_path = _scoped_snap(geo, scope, scale)
+            if args.wait_text is not None:
+                words = _ocr_words(img_path, upscale=args.upscale, conf_min=args.conf_min, preprocess=args.preprocess, psm=args.psm)
+                found = _find_text_target(words, args.wait_text) is not None
+            elif args.wait_color is not None:
+                found = _find_color_target(img_path, args.wait_color, args.tolerance) is not None
+            else:
+                fail("bad_args", "wait-chain requires --wait-text or --wait-color", EXIT_BAD_ARGS)
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
+            if found:
+                break
+            time.sleep(POLL_INTERVAL)
+        if not found:
+            fail("timeout", "Wait condition not met within timeout", EXIT_TIMEOUT)
+        chain_cmd = CmdChain()
+        chain_ns = argparse.Namespace(step=args.step)
+        state = chain_cmd.run(chain_ns, state)
+        state.update({"ok": True, "waited": True})
+        return state
+
+
+# ═════════════════════════════════════════════════════════════════
+#  CLI Wiring
+# ═════════════════════════════════════════════════════════════════
+def get_command_registry():
+    classes = [
+        CmdWindow, CmdFocus, CmdSnap, CmdOcr, CmdFindText, CmdFindColor,
+        CmdLines, CmdMove, CmdClick, CmdDrag, CmdKey, CmdType, CmdScope,
+        CmdRead, CmdChain, CmdWait, CmdAssert,
+        CmdClickText, CmdClickColor, CmdProbeColors, CmdWaitChain,
+    ]
+    return {cls.NAME: cls for cls in classes}
+
+
+def main():
+    registry = get_command_registry()
+    parser = argparse.ArgumentParser(prog="love-control", description="Modular, pipeable LÖVE2D automation")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for cls in registry.values():
+        cls.add_parser(sub)
+    parser.add_argument("--raw", type=str, help="Output only this field as plain text")
+    args = parser.parse_args()
+    raw_field = args.raw
+    cmd_cls = registry[args.command]
+    cmd = cmd_cls()
+    state = read_stdin_state() or {}
+    try:
+        state = cmd.run(args, state)
+        if raw_field:
+            val = state.get(raw_field)
+            if val is None:
+                fail("bad_args", f"Field '{raw_field}' not found in output", EXIT_BAD_ARGS)
+            if isinstance(val, (list, dict)):
+                print(json.dumps(val, separators=(",", ":")))
+            else:
+                print(val)
+            sys.exit(EXIT_SUCCESS)
+        print(json.dumps(state, separators=(",", ":")))
+        sys.exit(EXIT_SUCCESS)
+    except LoveControlError as e:
+        print(json.dumps(e.data, separators=(",", ":")))
+        sys.exit(e.code)
+
+
+if __name__ == "__main__":
+    main()
